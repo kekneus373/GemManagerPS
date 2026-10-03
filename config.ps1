@@ -2,10 +2,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $Config = [pscustomobject]@{
-    SourceDir       = 'D:\Crystal Finance'
+    SourceDir       = 'W:\Crystal Finance'
     StagingTemp     = Join-Path $env:LOCALAPPDATA 'Temp\GemManagerPS'
-    LocalTargets    = @('E:\ArchivesCrystal', 'H:\ArchivesCrystal')
-    SambaTarget     = 'Z:\Crystal_Mirror'
+    Targets    = @('X:\ArchivesCrystal', 'Y:\ArchivesCrystal', 'Z:\ArchivesCrystal')
     SevenZip        = 'C:\Program Files\7-Zip\7z.exe'
     ProtectedAdmin  = 'Administrator'
     WarnOffsetsMin  = @(10, 5, 2, 1)

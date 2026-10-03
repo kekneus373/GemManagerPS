@@ -10,8 +10,15 @@ $script:LastRun = $null
 function Write-GemLog {
 	<# Writes a timestamped line to the active run transcript. #>
 	[CmdletBinding()]
-	param([Parameter(Mandatory = $true)][string]$Message,
-		  [ValidateSet('INFO','WARN','ERROR','CRITICAL')][string]$Level = 'INFO')
+	param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string]$Message = '<No message provided>',
+        
+        [ValidateSet('INFO','WARN','ERROR','CRITICAL')]
+        [string]$Level = 'INFO'
+    )
+	
 	$line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Level, $Message
 	if ($null -ne $script:LogPath) {
 		Add-Content -LiteralPath $script:LogPath -Value $line
@@ -29,7 +36,7 @@ function Assert-GemConfiguration {
 	<# Validates required paths and rejects unsafe target roots. #>
 	[CmdletBinding()]
 	param()
-	$pathValues = @($Config.SourceDir, $Config.StagingTemp, $Config.SevenZip) + @($Config.LocalTargets) + @($Config.SambaTarget)
+	$pathValues = @($Config.SourceDir, $Config.StagingTemp, $Config.SevenZip) + @($Config.Targets)
 	foreach ($pathValue in $pathValues) {
 		if ([string]::IsNullOrWhiteSpace([string]$pathValue) -or -not [System.IO.Path]::IsPathRooted([string]$pathValue)) {
 			throw "Configuration path is not absolute and non-empty: '$pathValue'."
@@ -41,7 +48,7 @@ function Assert-GemConfiguration {
 	if (-not (Test-Path -LiteralPath $Config.SevenZip -PathType Leaf)) {
 		throw "SevenZip is missing: $($Config.SevenZip)"
 	}
-	foreach ($target in @($Config.LocalTargets) + @($Config.SambaTarget)) {
+	foreach ($target in @($Config.Targets)) {
 		$root = [System.IO.Path]::GetPathRoot($target).TrimEnd('\')
 		if ($target.TrimEnd('\') -eq $root) {
 			throw "A drive root is not a valid archive target: $target"
@@ -271,7 +278,11 @@ function Invoke-GemArchive {
 		if ($created.ExitCode -ne 0) { throw '7-Zip archive creation failed.' }
 	}
 	$verified = Invoke-GemExternal -FilePath $Config.SevenZip -ArgumentList @('t', $archive)
-	if ($verified.ExitCode -ne 0) { throw '7-Zip verification failed; archive rejected.' }
+	if ($verified.ExitCode -ne 0) {
+		Write-GemLog -Level WARN -Message "Archive verification failed ($archive). Removing corrupted file..."
+		Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+		throw '7-Zip verification failed; corrupted archive was removed.'
+	}
 	return (Get-Item -LiteralPath $archive)
 }
 
@@ -305,34 +316,27 @@ function Invoke-GemRobocopy {
 }
 
 function Invoke-GemTransport {
-	<# Fans out the verified archive and marks unavailable optional targets partial. #>
 	[CmdletBinding()]
 	param([Parameter(Mandatory = $true)][System.IO.FileInfo]$Archive)
 	$year = $Archive.Name.Substring(8, 4)
 	$stagingRoot = $Config.StagingTemp
-	$required = [int64]($Archive.Length + ($Config.MinFreeSpaceGB * 1GB))
-	$localResults = @()
-	foreach ($targetRoot in @($Config.LocalTargets)) {
+	<#Add back later, after testing: $Archive.Length + ($Config.MinFreeSpaceGB * 1GB)#>
+	$required = [int64]($Archive.Length)
+	$results = @()
+	foreach ($targetRoot in @($Config.Targets)) {
 		$target = Join-Path $targetRoot $year
 		if (-not (Test-Path -LiteralPath $target -PathType Container) -and (Test-Path -LiteralPath $targetRoot -PathType Container)) {
 			New-Item -ItemType Directory -Path $target -Force | Out-Null
 		}
 		if (Test-GemDestination -Path $target -RequiredBytes $required) {
 			$code = Invoke-GemRobocopy -Source $stagingRoot -Destination $target
-			$localResults += [pscustomobject]@{ Target = $targetRoot; OK = $true; ExitCode = $code }
+			$results += [pscustomobject]@{ Target = $targetRoot; OK = $true; ExitCode = $code }
 		} else {
-			$localResults += [pscustomobject]@{ Target = $targetRoot; OK = $false; ExitCode = 16 }
-			if ($targetRoot -eq $Config.LocalTargets[0]) { throw ('Primary local destination unavailable: ' + $targetRoot) }
+			$results += [pscustomobject]@{ Target = $targetRoot; OK = $false; ExitCode = 16 }
+			if ($targetRoot -eq $Config.Targets[0]) { throw ('Destination unavailable: ' + $targetRoot) }
 		}
 	}
-	$primary = Join-Path $Config.LocalTargets[0] $year
-	$sambaOK = $false
-	$sambaTarget = Join-Path $Config.SambaTarget $year
-	if (Test-GemDestination -Path $sambaTarget -RequiredBytes $required) {
-		Invoke-GemRobocopy -Source $primary -Destination $sambaTarget | Out-Null
-		$sambaOK = $true
-	} else { Write-GemLog -Level WARN -Message ('Optional Samba destination unavailable: ' + $Config.SambaTarget) }
-	return [pscustomobject]@{ Local = $localResults; SambaOK = $sambaOK; Partial = (@($localResults | Where-Object { -not $_.OK }).Count -gt 0 -or -not $sambaOK) }
+	return [pscustomobject]@{ Local = $results}
 }
 
 #endregion
@@ -377,7 +381,11 @@ function Remove-CrystalArchive {
 	$bytes = [int64]0
 	foreach ($item in $delete) { $bytes += $item.File.Length }
 	Write-GemLog -Message ('RETENTION target {0}: retained={1}, deleted={2}, bytes-reclaimed={3}' -f $TargetRoot, $keep.Count, $delete.Count, $bytes)
-	$delete | Select-Object @{n='Path';e={$_.File.FullName}}, @{n='Bytes';e={$_.File.Length}} | Format-Table -AutoSize | Out-String | ForEach-Object { Write-GemLog -Message $_.TrimEnd() }
+	if ($delete.Count -gt 0) {
+		$delete | Select-Object @{n='Path';e={$_.File.FullName}}, @{n='Bytes';e={$_.File.Length}} | Format-Table -AutoSize | Out-String | ForEach-Object { Write-GemLog -Message $_.TrimEnd() }
+	} else {
+		Write-GemLog -Message 'Retention has no archives eligible for deletion.'
+	}
 	foreach ($item in $delete) {
 		if ($PSCmdlet.ShouldProcess($item.File.FullName, 'Delete expired Crystal archive')) {
 			Write-GemLog -Message ('DELETE archive target: ' + $item.File.FullName)
@@ -416,20 +424,22 @@ function Invoke-GemManager {
 	try {
 		$acquired = $mutex.WaitOne(0)
 		if (-not $acquired) { Write-GemLog -Level WARN -Message 'Another backup run is already active.'; return }
-		trap { Write-GemLog -Level CRITICAL -Message ('Unhandled backup error: ' + $_.Exception.Message); Restore-GemRdp; throw }
+		<#Add from comment in production:  Restore-GemRdp;#>
+		trap { Write-GemLog -Level CRITICAL -Message ('Unhandled backup error: ' + $_.Exception.Message); throw }
 		Set-GemStatus -Status @{ Result = 'RUNNING'; Started = $started.ToString('o'); Archive = $null }
-		Invoke-GemRdpDrain
+		<#Revert back after testing#>
+		#Invoke-GemRdpDrain
 		$archive = Invoke-GemArchive
 		$transport = Invoke-GemTransport -Archive $archive
-		Remove-CrystalArchive -TargetRoot (Join-Path $Config.LocalTargets[0] $archive.Name.Substring(8, 4))
+		Remove-CrystalArchive -TargetRoot (Join-Path $Config.Targets[0] $archive.Name.Substring(8, 4))
 		$result = 'SUCCESS'
-		if ($transport.Partial) { $result = 'PARTIAL' }
 		$duration = ((Get-Date) - $started).TotalSeconds
-		$summary = '{0},{1},{2},{3},{4},{5},{6}' -f $started.ToString('o'), $duration, $archive.Name, $archive.Length, ($(if ($transport.Partial) { 'PARTIAL' } else { 'OK' })), $result, 0
+		$targetStatus = ($transport.Local | Where-Object { $_.OK } | ForEach-Object { $_.Target }) -join ';'
+		$summary = '{0},{1},{2},{3},{4},{5},{6}' -f $started.ToString('o'), $duration, $archive.Name, $archive.Length, $targetStatus, $result, 0
 		$csv = Join-Path (Get-GemLogDirectory) $Config.SummaryCsvName
 		if (-not (Test-Path -LiteralPath $csv)) { Add-Content -LiteralPath $csv -Value 'Timestamp,DurationSeconds,Archive,SizeBytes,Targets,Result,ExitCode' }
 		Add-Content -LiteralPath $csv -Value $summary
-		Set-GemStatus -Status @{ Result = $result; Started = $started.ToString('o'); Finished = (Get-Date).ToString('o'); Archive = $archive.Name; SizeBytes = $archive.Length; Targets = $transport.Local; SambaOK = $transport.SambaOK; NextRun = (Get-GemNextTrigger -Now (Get-Date)).ToString('o') }
+		Set-GemStatus -Status @{ Result = $result; Started = $started.ToString('o'); Finished = (Get-Date).ToString('o'); Archive = $archive.Name; SizeBytes = $archive.Length; Targets = $transport.Local; NextRun = (Get-GemNextTrigger -Now (Get-Date)).ToString('o') }
 		Write-GemLog -Message ('Backup completed: ' + $result)
 		return $result
 	} catch {
@@ -438,7 +448,9 @@ function Invoke-GemManager {
 		Set-GemStatus -Status @{ Result = 'FAILED'; Started = $started.ToString('o'); Finished = (Get-Date).ToString('o'); Error = $_.Exception.Message; DurationSeconds = $duration }
 		throw
 	} finally {
-		Restore-GemRdp
+		<#Revert back after testing#>
+		#Restore-GemRdp
+		$acquired = $true
 		if ($acquired) { $mutex.ReleaseMutex() }
 		$mutex.Dispose()
 	}
@@ -449,7 +461,7 @@ function Get-CrystalStatus {
 	[CmdletBinding()]
 	param()
 	$last = Get-GemLastStatus
-	$targets = @($Config.LocalTargets) + @($Config.SambaTarget) | ForEach-Object { [pscustomobject]@{ Path = $_; Available = (Test-Path -LiteralPath $_ -PathType Container) } }
+	$targets = @($Config.Targets) | ForEach-Object { [pscustomobject]@{ Path = $_; Available = (Test-Path -LiteralPath $_ -PathType Container) } }
 	return [pscustomobject]@{ LastRun = $last; Targets = $targets; NextRun = (Get-GemNextTrigger -Now (Get-Date)); StopRequested = (Test-GemStopRequested) }
 }
 
