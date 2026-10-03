@@ -266,6 +266,7 @@ function Invoke-GemArchive {
 	$free = (Get-Item -LiteralPath $Config.StagingTemp).PSDrive.Free
 	if ($lastSize -gt 0 -and $free -lt [int64]($lastSize * 1.2)) { Write-GemLog -Level WARN -Message 'Staging free space is below 1.2 times the last archive size.' }
 	$archive = Get-GemArchivePath -When (Get-Date)
+	$createdNewArchive = $false
 	if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
 		$sameDay = @(Get-ChildItem -LiteralPath $Config.StagingTemp -Filter ('crystal_{0}_*.7z' -f (Get-Date -Format 'yyyyMMdd')) -File | Sort-Object Name -Descending)
 		if ($sameDay.Count -gt 0) { $archive = $sameDay[0].FullName }
@@ -273,15 +274,23 @@ function Invoke-GemArchive {
 	if (Test-Path -LiteralPath $archive -PathType Leaf) {
 		Write-GemLog -Message ('Existing archive found; skipping compression: ' + $archive)
 	} else {
-		$archiveArgs = @('a', '-t7z', '-mx=3', '-mmt=on', '-ms=on', $archive, (Join-Path $Config.SourceDir '*'))
+		$archiveArgs = @($Config.SevenZipCreateArgs) + @($archive, (Join-Path $Config.SourceDir '*'))
 		$created = Invoke-GemExternal -FilePath $Config.SevenZip -ArgumentList $archiveArgs
 		if ($created.ExitCode -ne 0) { throw '7-Zip archive creation failed.' }
+		$createdNewArchive = $true
 	}
-	$verified = Invoke-GemExternal -FilePath $Config.SevenZip -ArgumentList @('t', $archive)
+	$verified = Invoke-GemExternal -FilePath $Config.SevenZip -ArgumentList (@($Config.SevenZipTestArgs) + @($archive))
 	if ($verified.ExitCode -ne 0) {
 		Write-GemLog -Level WARN -Message "Archive verification failed ($archive). Removing corrupted file..."
 		Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
 		throw '7-Zip verification failed; corrupted archive was removed.'
+	}
+	if ($createdNewArchive) {
+		$staleArchives = @(Get-ChildItem -LiteralPath $Config.StagingTemp -Filter 'crystal_*.7z' -File | Where-Object { $_.FullName -ne $archive })
+		foreach ($staleArchive in $staleArchives) {
+			Write-GemLog -Message ('DELETE stale staging archive target: ' + $staleArchive.FullName)
+			Remove-Item -LiteralPath $staleArchive.FullName -Force
+		}
 	}
 	return (Get-Item -LiteralPath $archive)
 }
@@ -305,11 +314,12 @@ function Test-GemDestination {
 }
 
 function Invoke-GemRobocopy {
-	<# Mirrors a directory with robocopy and accepts bitmask codes zero through seven. #>
+	<# Copies one named archive with robocopy and accepts bitmask codes zero through seven. #>
 	[CmdletBinding()]
 	param([Parameter(Mandatory = $true)][string]$Source,
-		  [Parameter(Mandatory = $true)][string]$Destination)
-	$arguments = @($Source, $Destination, '/MIR') + @($Config.RobocopyArgs)
+		  [Parameter(Mandatory = $true)][string]$Destination,
+		  [Parameter(Mandatory = $true)][string]$FileName)
+	$arguments = @($Source, $Destination, $FileName) + @($Config.RobocopyArgs)
 	$result = Invoke-GemExternal -FilePath 'robocopy.exe' -ArgumentList $arguments
 	if ($result.ExitCode -ge 8) { throw ('Robocopy failed ({0}) for {1}' -f $result.ExitCode, $Destination) }
 	return $result.ExitCode
@@ -319,24 +329,29 @@ function Invoke-GemTransport {
 	[CmdletBinding()]
 	param([Parameter(Mandatory = $true)][System.IO.FileInfo]$Archive)
 	$year = $Archive.Name.Substring(8, 4)
-	$stagingRoot = $Config.StagingTemp
 	<#Add back later, after testing: $Archive.Length + ($Config.MinFreeSpaceGB * 1GB)#>
 	$required = [int64]($Archive.Length)
 	$results = @()
 	foreach ($targetRoot in @($Config.Targets)) {
-		$target = Join-Path $targetRoot $year
-		if (-not (Test-Path -LiteralPath $target -PathType Container) -and (Test-Path -LiteralPath $targetRoot -PathType Container)) {
-			New-Item -ItemType Directory -Path $target -Force | Out-Null
-		}
-		if (Test-GemDestination -Path $target -RequiredBytes $required) {
-			$code = Invoke-GemRobocopy -Source $stagingRoot -Destination $target
-			$results += [pscustomobject]@{ Target = $targetRoot; OK = $true; ExitCode = $code }
-		} else {
-			$results += [pscustomobject]@{ Target = $targetRoot; OK = $false; ExitCode = 16 }
-			if ($targetRoot -eq $Config.Targets[0]) { throw ('Destination unavailable: ' + $targetRoot) }
+		try {
+			$target = Join-Path $targetRoot $year
+			if (-not (Test-Path -LiteralPath $target -PathType Container) -and (Test-Path -LiteralPath $targetRoot -PathType Container)) {
+				New-Item -ItemType Directory -Path $target -Force | Out-Null
+			}
+			if (-not (Test-GemDestination -Path $target -RequiredBytes $required)) {
+				throw ('Destination unavailable or insufficient space: ' + $target)
+			}
+			$code = Invoke-GemRobocopy -Source $Archive.DirectoryName -Destination $target -FileName $Archive.Name
+			$results += [pscustomobject]@{ Target = $targetRoot; OK = $true; ExitCode = $code; Error = $null }
+		} catch {
+			Write-GemLog -Level WARN -Message ('Destination failed; continuing to next target: {0}; {1}' -f $targetRoot, $_.Exception.Message)
+			$results += [pscustomobject]@{ Target = $targetRoot; OK = $false; ExitCode = 16; Error = $_.Exception.Message }
 		}
 	}
-	return [pscustomobject]@{ Local = $results}
+	$successfulTargets = @($results | Where-Object { $_.OK })
+	if ($successfulTargets.Count -eq 0) { throw 'Archive transport failed for every configured destination.' }
+	$partial = @($results | Where-Object { -not $_.OK }).Count -gt 0
+	return [pscustomobject]@{ Local = $results; Partial = $partial; Year = $year }
 }
 
 #endregion
@@ -367,7 +382,14 @@ function Remove-CrystalArchive {
 	$dated = @($files | ForEach-Object { $date = Get-GemArchiveDate -Name $_.Name; if ($null -ne $date) { [pscustomobject]@{ File = $_; Date = $date } } })
 	$keep = @{}
 	foreach ($item in @($dated | Sort-Object Date -Descending | Select-Object -First $Config.Retention.d)) { $keep[$item.File.FullName] = $true }
-	foreach ($item in @($dated | Group-Object { Get-GemIsoWeekKey -Date $_.Date })) { $newest = $item.Group | Sort-Object Date -Descending | Select-Object -First 1; if (-not $keep.ContainsKey($newest.File.FullName)) { $keep[$newest.File.FullName] = $true } }
+	$weekly = @(
+		$dated |
+		Group-Object { Get-GemIsoWeekKey -Date $_.Date } |
+		ForEach-Object { $_.Group | Sort-Object Date -Descending | Select-Object -First 1 } |
+		Sort-Object Date -Descending |
+		Select-Object -First $Config.Retention.w
+	)
+	foreach ($item in $weekly) { if (-not $keep.ContainsKey($item.File.FullName)) { $keep[$item.File.FullName] = $true } }
 	$monthly = @($dated | Group-Object { '{0:yyyy-MM}' -f $_.Date } | ForEach-Object {
 		$monthDate = $_.Group[0].Date
 		$firstDay = Get-Date -Year $monthDate.Year -Month $monthDate.Month -Day 1
@@ -431,11 +453,23 @@ function Invoke-GemManager {
 		#Invoke-GemRdpDrain
 		$archive = Invoke-GemArchive
 		$transport = Invoke-GemTransport -Archive $archive
-		Remove-CrystalArchive -TargetRoot (Join-Path $Config.Targets[0] $archive.Name.Substring(8, 4))
+		foreach ($targetResult in @($transport.Local | Where-Object { $_.OK })) {
+			try {
+				Remove-CrystalArchive -TargetRoot (Join-Path $targetResult.Target $transport.Year) -Confirm:$false
+			} catch {
+				Write-GemLog -Level WARN -Message ('Retention failed at {0}: {1}' -f $targetResult.Target, $_.Exception.Message)
+				$targetResult.OK = $false
+				$targetResult.Error = 'Retention failed: ' + $_.Exception.Message
+			}
+		}
+		$transport.Partial = $transport.Partial -or (@($transport.Local | Where-Object { -not $_.OK }).Count -gt 0)
 		$result = 'SUCCESS'
+		if ($transport.Partial) { $result = 'PARTIAL' }
 		$duration = ((Get-Date) - $started).TotalSeconds
-		$targetStatus = ($transport.Local | Where-Object { $_.OK } | ForEach-Object { $_.Target }) -join ';'
-		$summary = '{0},{1},{2},{3},{4},{5},{6}' -f $started.ToString('o'), $duration, $archive.Name, $archive.Length, $targetStatus, $result, 0
+		$targetStatus = ($transport.Local | ForEach-Object { '{0}:{1}' -f $_.Target, $(if ($_.OK) { 'OK' } else { 'FAIL' }) }) -join ';'
+		$exitCode = 0
+		if ($transport.Partial) { $exitCode = 2 }
+		$summary = '{0},{1},{2},{3},{4},{5},{6}' -f $started.ToString('o'), $duration, $archive.Name, $archive.Length, $targetStatus, $result, $exitCode
 		$csv = Join-Path (Get-GemLogDirectory) $Config.SummaryCsvName
 		if (-not (Test-Path -LiteralPath $csv)) { Add-Content -LiteralPath $csv -Value 'Timestamp,DurationSeconds,Archive,SizeBytes,Targets,Result,ExitCode' }
 		Add-Content -LiteralPath $csv -Value $summary

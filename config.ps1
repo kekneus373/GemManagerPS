@@ -6,6 +6,8 @@ $Config = [pscustomobject]@{
     StagingTemp     = Join-Path $env:LOCALAPPDATA 'Temp\GemManagerPS'
     Targets    = @('X:\ArchivesCrystal', 'Y:\ArchivesCrystal', 'Z:\ArchivesCrystal')
     SevenZip        = 'C:\Program Files\7-Zip\7z.exe'
+    SevenZipCreateArgs = @('a', '-t7z', '-mx=3', '-mmt=on', '-ms=on')
+    SevenZipTestArgs   = @('t')
     ProtectedAdmin  = 'Administrator'
     WarnOffsetsMin  = @(10, 5, 2, 1)
     LogDir          = Join-Path $env:APPDATA 'GemManagerPS\Logs\backup_<stamp>.log'
