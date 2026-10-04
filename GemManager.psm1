@@ -290,18 +290,10 @@ function Invoke-GemArchive {
 	if ($lastSize -gt 0 -and $free -lt [int64]($lastSize * 1.2)) { Write-GemLog -Level WARN -Message 'Staging free space is below 1.2 times the last archive size.' }
 	$archive = Get-GemArchivePath -When (Get-Date)
 	$createdNewArchive = $false
-	if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
-		$sameDay = @(Get-ChildItem -LiteralPath $Config.StagingTemp -Filter ('crystal_{0}_*.7z' -f (Get-Date -Format 'yyyyMMdd')) -File | Sort-Object Name -Descending)
-		if ($sameDay.Count -gt 0) { $archive = $sameDay[0].FullName }
-	}
-	if (Test-Path -LiteralPath $archive -PathType Leaf) {
-		Write-GemLog -Message ('Existing archive found; skipping compression: ' + $archive)
-	} else {
-		$archiveArgs = @($Config.SevenZipCreateArgs) + @($archive, (Join-Path $Config.SourceDir '*'))
-		$created = Invoke-GemExternal -FilePath $Config.SevenZip -ArgumentList $archiveArgs
-		if ($created.ExitCode -ne 0) { throw '7-Zip archive creation failed.' }
-		$createdNewArchive = $true
-	}
+	$archiveArgs = @($Config.SevenZipCreateArgs) + @($archive, (Join-Path $Config.SourceDir '*'))
+	$created = Invoke-GemExternal -FilePath $Config.SevenZip -ArgumentList $archiveArgs
+	if ($created.ExitCode -ne 0) { throw '7-Zip archive creation failed.' }
+	$createdNewArchive = $true
 	$verified = Invoke-GemExternal -FilePath $Config.SevenZip -ArgumentList (@($Config.SevenZipTestArgs) + @($archive))
 	if ($verified.ExitCode -ne 0) {
 		Write-GemLog -Level WARN -Message "Archive verification failed ($archive). Removing corrupted file..."
@@ -357,7 +349,7 @@ function Invoke-GemTransport {
 	foreach ($targetRoot in @($Config.Targets)) {
 		try {
 			$target = Join-Path $targetRoot $year
-			if (-not (Test-Path -LiteralPath $target -PathType Container) -and (Test-Path -LiteralPath $targetRoot -PathType Container)) {
+			if (-not (Test-Path -LiteralPath $target -PathType Container)) {
 				New-Item -ItemType Directory -Path $target -Force | Out-Null
 			}
 			if (-not (Test-GemDestination -Path $target -RequiredBytes $required)) {
