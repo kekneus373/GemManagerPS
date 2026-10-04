@@ -21,7 +21,7 @@ function Get-GemStartupNotice {
     [CmdletBinding()]
     param()
     $startup = [Environment]::GetFolderPath('Startup')
-    $shortcut = Get-ChildItem -LiteralPath $startup -Filter '*.lnk' -File | Where-Object { $_.Name -match 'GemManager|Crystal' } | Select-Object -First 1
+    $shortcut = Get-ChildItem -LiteralPath $startup -Filter '*.lnk' -File | Where-Object { $_.Name -match 'Gem|Crystal' } | Select-Object -First 1
     if ($null -eq $shortcut) {
         return "Startup shortcut not found in $startup. You may add one for auto-start, targeting powershell.exe -File `"$PSCommandPath`" -Daemon."
     }
