@@ -79,8 +79,14 @@ function Invoke-GemExternal {
 	param([Parameter(Mandatory = $true)][string]$FilePath,
 		  [Parameter(Mandatory = $true)][string[]]$ArgumentList)
 	Write-GemLog -Message ('EXEC {0} {1}' -f $FilePath, ($ArgumentList -join ' '))
-	$output = @(& $FilePath @ArgumentList 2>&1)
-	$exitCode = $LASTEXITCODE
+	$previousErrorActionPreference = $ErrorActionPreference
+	try {
+		$ErrorActionPreference = 'Continue'
+		$output = @(& $FilePath @ArgumentList 2>&1)
+		$exitCode = $LASTEXITCODE
+	} finally {
+		$ErrorActionPreference = $previousErrorActionPreference
+	}
 	foreach ($line in $output) { Write-GemLog -Message ('  ' + [string]$line) }
 	Write-GemLog -Message ('EXIT {0}: {1}' -f $exitCode, $FilePath)
 	return [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
@@ -169,6 +175,17 @@ function Get-GemUserSessions {
 	return @($sessions | Where-Object { $_.Id -ne 0 -and $_.SessionName -ne 'console' -and $_.Username -ne $Config.ProtectedAdmin })
 }
 
+function Test-GemChangeLogonState {
+	<# Checks the change-logon output for its effective state, falling back to exit code. #>
+	[CmdletBinding()]
+	param([Parameter(Mandatory = $true)][pscustomobject]$Result,
+		  [Parameter(Mandatory = $true)][ValidateSet('ENABLED', 'DISABLED')][string]$ExpectedState)
+	$outputText = [string]::Join("`n", @($Result.Output | ForEach-Object { [string]$_ }))
+	$stateMatch = [regex]::Match($outputText, '(?im)Session logins are currently\s+(ENABLED|DISABLED)')
+	if ($stateMatch.Success) { return ($stateMatch.Groups[1].Value -eq $ExpectedState) }
+	return ($Result.ExitCode -eq 0)
+}
+
 function Restore-GemRdp {
 	<# Idempotently re-enables new RDP logons. #>
 	[CmdletBinding()]
@@ -176,7 +193,11 @@ function Restore-GemRdp {
 	try {
 		Write-GemLog -Message 'RESTORE target RDP logon state: change logon /enable.'
 		$restore = Invoke-GemExternal -FilePath 'change.exe' -ArgumentList @('logon', '/enable')
-		if ($restore.ExitCode -ge 1) { Write-GemLog -Level ERROR -Message 'RDP restore command returned a failure.' }
+		if (Test-GemChangeLogonState -Result $restore -ExpectedState 'ENABLED') {
+			Write-GemLog -Message 'RDP logon state confirmed ENABLED.'
+		} else {
+			Write-GemLog -Level CRITICAL -Message ('RDP restore did not confirm ENABLED; exit code {0}.' -f $restore.ExitCode)
+		}
 	} catch {
 		Write-GemLog -Level CRITICAL -Message ('RDP restore failed: ' + $_.Exception.Message)
 	}
@@ -234,7 +255,9 @@ function Invoke-GemRdpDrain {
 	}
 	Write-GemLog -Message 'LOCKDOWN target: new RDP logons via change logon /disable.'
 	$disable = Invoke-GemExternal -FilePath 'change.exe' -ArgumentList @('logon', '/disable')
-	if ($disable.ExitCode -ge 1) { throw 'Could not disable new RDP logons; backup aborted.' }
+	if (-not (Test-GemChangeLogonState -Result $disable -ExpectedState 'DISABLED')) {
+		throw ('Could not confirm RDP logons disabled; change.exe exit code {0}.' -f $disable.ExitCode)
+	}
 }
 
 #endregion
