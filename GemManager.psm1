@@ -329,8 +329,7 @@ function Invoke-GemTransport {
 	[CmdletBinding()]
 	param([Parameter(Mandatory = $true)][System.IO.FileInfo]$Archive)
 	$year = $Archive.Name.Substring(8, 4)
-	<#Add back later, after testing: $Archive.Length + ($Config.MinFreeSpaceGB * 1GB)#>
-	$required = [int64]($Archive.Length)
+	$required = [int64]($Archive.Length + ($Config.MinFreeSpaceGB * 1GB))
 	$results = @()
 	foreach ($targetRoot in @($Config.Targets)) {
 		try {
@@ -446,11 +445,9 @@ function Invoke-GemManager {
 	try {
 		$acquired = $mutex.WaitOne(0)
 		if (-not $acquired) { Write-GemLog -Level WARN -Message 'Another backup run is already active.'; return }
-		<#Add from comment in production:  Restore-GemRdp;#>
-		trap { Write-GemLog -Level CRITICAL -Message ('Unhandled backup error: ' + $_.Exception.Message); throw }
+		trap { Write-GemLog -Level CRITICAL -Message ('Unhandled backup error: ' + $_.Exception.Message); Restore-GemRdp; throw }
 		Set-GemStatus -Status @{ Result = 'RUNNING'; Started = $started.ToString('o'); Archive = $null }
-		<#Revert back after testing#>
-		#Invoke-GemRdpDrain
+		Invoke-GemRdpDrain
 		$archive = Invoke-GemArchive
 		$transport = Invoke-GemTransport -Archive $archive
 		foreach ($targetResult in @($transport.Local | Where-Object { $_.OK })) {
@@ -482,9 +479,7 @@ function Invoke-GemManager {
 		Set-GemStatus -Status @{ Result = 'FAILED'; Started = $started.ToString('o'); Finished = (Get-Date).ToString('o'); Error = $_.Exception.Message; DurationSeconds = $duration }
 		throw
 	} finally {
-		<#Revert back after testing#>
-		#Restore-GemRdp
-		$acquired = $true
+		Restore-GemRdp
 		if ($acquired) { $mutex.ReleaseMutex() }
 		$mutex.Dispose()
 	}
